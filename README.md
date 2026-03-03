@@ -1,88 +1,42 @@
-# Swayimg: image viewer for Wayland
+# fork of [Swayimg](https://github.com/artemsen/swayimg): image viewer for Wayland
 
 Fully customizable and lightweight image viewer for Wayland based display servers.
 
-- Support for the most popular image formats:
-  - JPEG (via [libjpeg](http://libjpeg.sourceforge.net)),
-  - JPEG XL (via [libjxl](https://github.com/libjxl/libjxl));
-  - PNG (via [libpng](http://www.libpng.org));
-  - GIF (via [giflib](http://giflib.sourceforge.net));
-  - SVG (via [librsvg](https://gitlab.gnome.org/GNOME/librsvg));
-  - WebP (via [libwebp](https://chromium.googlesource.com/webm/libwebp));
-  - HEIF/AVIF (via [libheif](https://github.com/strukturag/libheif));
-  - AV1F/AVIFS (via [libavif](https://github.com/AOMediaCodec/libavif));
-  - TIFF (via [libtiff](https://libtiff.gitlab.io/libtiff));
-  - Sixel (via [libsixel](https://github.com/saitoha/libsixel));
-  - Raw: CRW/CR2, NEF, RAF, etc (via [libraw](https://www.libraw.org));
-  - EXR (via [OpenEXR](https://openexr.com));
-  - BMP (built-in);
-  - PNM (built-in);
-  - TGA (built-in);
-  - QOI (built-in);
-  - DICOM (built-in);
-  - Farbfeld (built-in).
-- Fully customizable keyboard bindings, colors, and [many other](https://github.com/artemsen/swayimg/blob/master/extra/swayimgrc) parameters;
-- Loading images from files and pipes;
-- Gallery and viewer modes with slideshow and animation support;
-- Preload images in a separate thread;
-- Cache in memory, no data is written to permanent storage (HDD/SSD);
-- [Sway](https://swaywm.org) and [Hyprland](https://hyprland.org/) integration
-mode: the application creates an "overlay" above the currently active window,
-which gives the illusion that you are opening the image directly in a terminal
-window (not enabled by default).
+# CJK fonts fix
 
-![Viewer mode](https://raw.githubusercontent.com/artemsen/swayimg/master/.github/viewer.png)
-![Gallery mode](https://raw.githubusercontent.com/artemsen/swayimg/master/.github/gallery.png)
+CJK characters are rendered as "tofu" blocks:
 
-## Usage
+```conf
+[font]
+name = SourceCodePro
+```
 
-`swayimg [OPTIONS]... [FILE]...`
+![](./misc/1.png)
 
-See [man page](https://github.com/artemsen/swayimg/blob/master/extra/swayimg.1.scd?plain=1) for details.
+---
 
-Examples:
-- View multiple files:
-  ```
-  swayimg photo.jpg logo.png
-  ```
-- Start slideshow for all files (recursively) in the current directory in random order:
-  ```
-  swayimg --slideshow --recursive --order=random
-  ```
-- View using pipes:
-  ```
-  wget -qO- https://www.kernel.org/theme/images/logos/tux.png | swayimg -
-  ```
-- Loading stdout from external commands:
-  ```
-  swayimg "exec://wget -qO- https://www.kernel.org/theme/images/logos/tux.png" \
-          "exec://curl -so- https://www.kernel.org/theme/images/logos/tux.png"
-  ```
-- View all images from the current directory in gallery mode:
-  ```
-  swayimg --gallery
-  ```
+Although sepcifying the CJK fonts in `swayimgrc` can fix this, but the font for
+ASCII/Latin characters would be changed as a side effect:
 
-## Configuration
+```conf
+[font]
+name = Noto Sans CJK JP
+```
 
-The viewer searches for the configuration file with name `config` in the
-following directories:
-- `$XDG_CONFIG_HOME/swayimg`
-- `$HOME/.config/swayimg`
-- `$XDG_CONFIG_DIRS/swayimg`
-- `/etc/xdg/swayimg`
+![](./misc/2.png)
 
-Sample file is available [here](https://github.com/artemsen/swayimg/blob/master/extra/swayimgrc) or locally `/usr/share/swayimg/swayimgrc`.
+---
 
-See [man page](https://github.com/artemsen/swayimg/blob/master/extra/swayimgrc.5.scd?plain=1) for details.
+This fork add the fallback fonts support, so the default font family is
+respected and CJK characters are rendered correctly:
 
-## Install
+```conf
+[font]
+name = SourceCodePro
+```
 
-[![Packaging status](https://repology.org/badge/tiny-repos/swayimg.svg)](https://repology.org/project/swayimg/versions)
+![](./misc/3.png)
 
-List of supported distributives can be found on the [Repology page](https://repology.org/project/swayimg/versions).
-
-Arch users can install the program from the extra repository: [swayimg](https://archlinux.org/packages/extra/x86_64/swayimg) or from AUR [swayimg-git](https://aur.archlinux.org/packages/swayimg-git) package.
 
 ## Build
 
