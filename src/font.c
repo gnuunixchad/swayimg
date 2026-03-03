@@ -12,15 +12,44 @@
 #include FT_FREETYPE_H
 #include FT_GLYPH_H
 
+#include <unistd.h>
+
 #define POINT_FACTOR 64.0 // default points per pixel for 26.6 format
 #define SPACE_WH_REL 2.0
 
 #define BACKGROUND_PADDING 5
+#define MAX_FONTS 4
+#define GLYPH_CACHE_SIZE 128
+#define RANGE_BITMAP_SIZE 8192 // Covers up to 0xFFFF (65535/8)
+
+struct unicode_range {
+    wchar_t start;
+    wchar_t end;
+};
+
+struct glyph_cache_entry {
+    wchar_t ch;
+    FT_Glyph glyph;
+    int advance;
+};
+
+struct font_entry {
+    FT_Face face;                   ///< Font face instance (NULL if not loaded)
+    char* name;                     ///< Font name
+    struct unicode_range* ranges;   ///< Array of Unicode ranges
+    size_t num_ranges;              ///< Number of ranges
+    char* font_path;                ///< Cached font path
+    bool loaded;                    ///< Whether font is loaded
+    uint8_t range_bitmap[RANGE_BITMAP_SIZE]; ///< Fast lookup bitmap
+    struct glyph_cache_entry glyph_cache[GLYPH_CACHE_SIZE]; ///< Glyph cache
+    int cache_pos;                  ///< Current cache position
+};
 
 /** Font context. */
 struct font {
     FT_Library lib;    ///< Font lib instance
-    FT_Face face;      ///< Font face instance
+    struct font_entry fonts[MAX_FONTS]; ///< Array of fonts
+    size_t num_fonts;  ///< Number of loaded fonts
     size_t size;       ///< Font size in points
     argb_t color;      ///< Font color
     argb_t shadow;     ///< Font shadow color
@@ -29,6 +58,103 @@ struct font {
 
 /** Global font context instance. */
 static struct font ctx;
+
+/**
+ * Parse Unicode range string (e.g., "4E00-9FFF", "3040-30FF", "20-7E")
+ * @param range_str Range string
+ * @param ranges Output array of ranges
+ * @param max_ranges Maximum number of ranges to parse
+ * @return Number of ranges parsed
+ */
+static size_t parse_unicode_ranges(const char* range_str,
+                                   struct unicode_range* ranges,
+                                   size_t max_ranges)
+{
+    size_t num_ranges = 0;
+    const char* p = range_str;
+
+    while (*p && num_ranges < max_ranges) {
+        // Skip whitespace
+        while (*p == ' ') p++;
+        if (!*p) break;
+
+        // Parse start
+        char* end;
+        long start = strtol(p, &end, 16);
+        if (end == p) break;
+
+        p = end;
+        while (*p == ' ') p++;
+
+        // Check for dash
+        if (*p != '-') break;
+        p++;
+        while (*p == ' ') p++;
+
+        // Parse end
+        long end_val = strtol(p, &end, 16);
+        if (end == p) break;
+
+        ranges[num_ranges].start = start;
+        ranges[num_ranges].end = end_val;
+        num_ranges++;
+
+        p = end;
+        while (*p == ' ') p++;
+
+        // Skip comma
+        if (*p == ',') p++;
+    }
+
+    return num_ranges;
+}
+
+/**
+ * Build bitmap for fast character lookup
+ * @param entry Font entry to build bitmap for
+ */
+static void build_range_bitmap(struct font_entry* entry)
+{
+    memset(entry->range_bitmap, 0, RANGE_BITMAP_SIZE);
+
+    for (size_t i = 0; i < entry->num_ranges; i++) {
+        wchar_t start = entry->ranges[i].start;
+        wchar_t end = entry->ranges[i].end;
+
+        // Only cache BMP (Basic Multilingual Plane) for performance
+        if (start > 0xFFFF) continue;
+        if (end > 0xFFFF) end = 0xFFFF;
+
+        for (wchar_t ch = start; ch <= end; ch++) {
+            size_t byte = ch / 8;
+            size_t bit = ch % 8;
+            entry->range_bitmap[byte] |= (1 << bit);
+        }
+    }
+}
+
+/**
+ * Fast character coverage check using bitmap
+ * @param ch Unicode character
+ * @param entry Font entry to check
+ * @return true if character is covered
+ */
+static bool is_char_covered_fast(wchar_t ch, const struct font_entry* entry)
+{
+    if (ch <= 0xFFFF) {
+        size_t byte = ch / 8;
+        size_t bit = ch % 8;
+        return (entry->range_bitmap[byte] >> bit) & 1;
+    }
+
+    // Fall back to range check for supplementary planes
+    for (size_t i = 0; i < entry->num_ranges; i++) {
+        if (ch >= entry->ranges[i].start && ch <= entry->ranges[i].end) {
+            return true;
+        }
+    }
+    return false;
+}
 
 /**
  * Get path to the font file by its name.
@@ -74,6 +200,154 @@ static bool search_font_file(const char* name, char* font_file, size_t len)
 }
 
 /**
+ * Ensure font is loaded (lazy loading)
+ * @param entry Font entry to load
+ * @return true if font is available
+ */
+static bool ensure_font_loaded(struct font_entry* entry)
+{
+    if (entry->loaded) return true;
+
+    if (!entry->font_path) {
+        char font_file[PATH_MAX];
+        if (!search_font_file(entry->name, font_file, sizeof(font_file))) {
+            return false;
+        }
+        entry->font_path = strdup(font_file);
+    }
+
+    if (FT_New_Face(ctx.lib, entry->font_path, 0, &entry->face) == 0) {
+        entry->loaded = true;
+        FT_Set_Char_Size(entry->face, ctx.size * POINT_FACTOR, 0, 96, 0);
+        return true;
+    }
+
+    return false;
+}
+
+/**
+ * Get cached glyph
+ * @param entry Font entry
+ * @param ch Character to get glyph for
+ * @param advance Output advance width
+ * @return Glyph or NULL if not available
+ */
+static FT_Glyph get_cached_glyph(struct font_entry* entry, wchar_t ch, int* advance)
+{
+    // Check cache
+    for (int i = 0; i < GLYPH_CACHE_SIZE; i++) {
+        if (entry->glyph_cache[i].ch == ch) {
+            *advance = entry->glyph_cache[i].advance;
+            return entry->glyph_cache[i].glyph;
+        }
+    }
+
+    // Ensure font is loaded
+    if (!ensure_font_loaded(entry)) {
+        return NULL;
+    }
+
+    // Load glyph
+    if (FT_Load_Char(entry->face, ch, FT_LOAD_RENDER) != 0) {
+        return NULL;
+    }
+
+    FT_Glyph glyph;
+    if (FT_Get_Glyph(entry->face->glyph, &glyph) != 0) {
+        return NULL;
+    }
+
+    *advance = entry->face->glyph->advance.x / POINT_FACTOR;
+
+    // Add to cache (FIFO)
+    int pos = entry->cache_pos++ % GLYPH_CACHE_SIZE;
+    if (entry->glyph_cache[pos].glyph) {
+        FT_Done_Glyph(entry->glyph_cache[pos].glyph);
+    }
+    entry->glyph_cache[pos].ch = ch;
+    entry->glyph_cache[pos].glyph = glyph;
+    entry->glyph_cache[pos].advance = *advance;
+
+    return glyph;
+}
+
+/**
+ * Add a font to the context
+ * @param name Font name
+ * @param ranges Unicode ranges this font covers
+ * @return Index of added font, or SIZE_MAX on error
+ */
+static size_t add_font(const char* name, const char* ranges_str)
+{
+    if (ctx.num_fonts >= MAX_FONTS) {
+        fprintf(stderr, "WARNING: Maximum number of fonts reached\n");
+        return SIZE_MAX;
+    }
+
+    struct font_entry* entry = &ctx.fonts[ctx.num_fonts];
+    memset(entry, 0, sizeof(struct font_entry));
+
+    // Parse ranges first to know exact count
+    struct unicode_range temp_ranges[16];
+    size_t range_count = parse_unicode_ranges(ranges_str, temp_ranges, 16);
+
+    if (range_count == 0) {
+        range_count = 1;
+        temp_ranges[0].start = 0x20;
+        temp_ranges[0].end = 0x7E;
+    }
+
+    // Single allocation for name and ranges
+    size_t name_len = strlen(name) + 1;
+    size_t ranges_size = sizeof(struct unicode_range) * range_count;
+    char* block = malloc(name_len + ranges_size);
+    if (!block) {
+        fprintf(stderr, "WARNING: Failed to allocate memory for font %s\n", name);
+        return SIZE_MAX;
+    }
+
+    entry->name = block;
+    strcpy(entry->name, name);
+
+    entry->ranges = (struct unicode_range*)(block + name_len);
+    memcpy(entry->ranges, temp_ranges, ranges_size);
+    entry->num_ranges = range_count;
+
+    // Build fast lookup bitmap
+    build_range_bitmap(entry);
+
+    // Don't load font yet (lazy loading)
+    entry->loaded = false;
+    entry->face = NULL;
+    entry->font_path = NULL;
+
+    ctx.num_fonts++;
+    return ctx.num_fonts - 1;
+}
+
+/**
+ * Find the best font for a character
+ * @param ch Character to find font for
+ * @return Font entry to use, or NULL if not found
+ */
+static struct font_entry* find_font_entry_for_char(wchar_t ch)
+{
+    // Try to find a font that covers this character
+    for (size_t i = 0; i < ctx.num_fonts; i++) {
+        if (is_char_covered_fast(ch, &ctx.fonts[i])) {
+            return &ctx.fonts[i];
+        }
+    }
+
+    // Fall back to default font (first one)
+    if (ctx.num_fonts > 0) {
+        return &ctx.fonts[0];
+    }
+
+    return NULL;
+}
+
+/**
  * Calc size of the surface and allocate memory for the mask.
  * @param text string to print
  * @param surface text surface
@@ -82,11 +356,19 @@ static bool search_font_file(const char* name, char* font_file, size_t len)
 static size_t allocate_surface(const wchar_t* text,
                                struct text_surface* surface)
 {
-    const FT_Size_Metrics* metrics = &ctx.face->size->metrics;
+    if (ctx.num_fonts == 0) return SIZE_MAX;
+
+    // Ensure first font is loaded for metrics
+    if (!ensure_font_loaded(&ctx.fonts[0])) {
+        return SIZE_MAX;
+    }
+
+    FT_Face default_face = ctx.fonts[0].face;
+    const FT_Size_Metrics* metrics = &default_face->size->metrics;
     const size_t space_size = metrics->x_ppem / SPACE_WH_REL;
     const size_t height = metrics->height / POINT_FACTOR;
     size_t base_offset =
-        (ctx.face->ascender * (metrics->y_scale / 65536.0)) / POINT_FACTOR;
+        (default_face->ascender * (metrics->y_scale / 65536.0)) / POINT_FACTOR;
     size_t width = 0;
     uint8_t* data = NULL;
     size_t data_size;
@@ -95,11 +377,21 @@ static size_t allocate_surface(const wchar_t* text,
     while (*text) {
         if (*text == L' ') {
             width += space_size;
-        } else if (FT_Load_Char(ctx.face, *text, FT_LOAD_RENDER) == 0) {
-            const FT_GlyphSlot glyph = ctx.face->glyph;
-            width += glyph->advance.x / POINT_FACTOR;
-            if ((FT_Int)base_offset < glyph->bitmap_top) {
-                base_offset = glyph->bitmap_top;
+        } else {
+            struct font_entry* entry = find_font_entry_for_char(*text);
+            if (entry) {
+                int advance;
+                if (get_cached_glyph(entry, *text, &advance)) {
+                    width += advance;
+
+                    // Update base offset if needed
+                    if (entry->loaded && entry->face) {
+                        FT_Load_Char(entry->face, *text, FT_LOAD_RENDER);
+                        if ((FT_Int)base_offset < entry->face->glyph->bitmap_top) {
+                            base_offset = entry->face->glyph->bitmap_top;
+                        }
+                    }
+                }
             }
         }
         ++text;
@@ -123,16 +415,78 @@ static size_t allocate_surface(const wchar_t* text,
 
 void font_init(const struct config* cfg)
 {
-    char font_file[PATH_MAX] = { 0 };
-    const char* font_name;
     const struct config* section = config_section(cfg, CFG_FONT);
 
     // load font
-    font_name = config_get(section, CFG_FONT_NAME);
-    if (!search_font_file(font_name, font_file, sizeof(font_file)) ||
-        FT_Init_FreeType(&ctx.lib) != 0 ||
-        FT_New_Face(ctx.lib, font_file, 0, &ctx.face) != 0) {
-        fprintf(stderr, "WARNING: Unable to load font %s\n", font_name);
+    if (FT_Init_FreeType(&ctx.lib) != 0) {
+        fprintf(stderr, "WARNING: Unable to initialize FreeType\n");
+        return;
+    }
+
+    // Parse font configurations
+    // Format: font.N.name = "Font Name"
+    //         font.N.ranges = "4E00-9FFF,3040-30FF" (hex ranges, comma-separated)
+
+    char key_name[64];
+    char key_ranges[64];
+    int font_idx = 0;
+    int found = 0;
+
+    // Temporarily redirect stderr to suppress warnings from config_get
+    int stderr_backup = dup(fileno(stderr));
+    FILE* devnull = fopen("/dev/null", "w");
+    if (devnull) {
+        dup2(fileno(devnull), fileno(stderr));
+    }
+
+    while (font_idx < MAX_FONTS) {
+        snprintf(key_name, sizeof(key_name), "font.%d.name", font_idx + 1);
+
+        const char* name = config_get(section, key_name);
+        if (!name) {
+            break;
+        }
+        found = 1;
+
+        snprintf(key_ranges, sizeof(key_ranges), "font.%d.ranges", font_idx + 1);
+        const char* ranges = config_get(section, key_ranges);
+        if (!ranges) {
+            ranges = "20-7E";  // ASCII
+        }
+
+        if (add_font(name, ranges) == SIZE_MAX) {
+            // Restore stderr temporarily to print this warning
+            dup2(stderr_backup, fileno(stderr));
+            fprintf(stderr, "WARNING: Failed to load font %d: %s\n", font_idx + 1, name);
+            if (devnull) {
+                dup2(fileno(devnull), fileno(stderr));
+            }
+        }
+
+        font_idx++;
+    }
+
+    // Restore stderr
+    if (devnull) {
+        fflush(stderr);
+        dup2(stderr_backup, fileno(stderr));
+        close(stderr_backup);
+        fclose(devnull);
+    }
+
+    // If no fonts loaded via font.N, try default font
+    if (ctx.num_fonts == 0) {
+        const char* default_font = config_get(section, CFG_FONT_NAME);
+        if (default_font) {
+            // Default font should cover CJK ranges too
+            add_font(default_font, "20-7E,4E00-9FFF,3040-30FF,AC00-D7AF");
+            found = 1;
+        }
+    }
+
+    if (!found || ctx.num_fonts == 0) {
+        fprintf(stderr, "WARNING: No fonts loaded\n");
+        FT_Done_FreeType(ctx.lib);
         return;
     }
 
@@ -148,13 +502,28 @@ void font_init(const struct config* cfg)
 
 void font_set_scale(double scale)
 {
-    FT_Set_Char_Size(ctx.face, ctx.size * POINT_FACTOR, 0, 96 * scale, 0);
+    for (size_t i = 0; i < ctx.num_fonts; i++) {
+        if (ctx.fonts[i].loaded) {
+            FT_Set_Char_Size(ctx.fonts[i].face, ctx.size * POINT_FACTOR, 0, 96 * scale, 0);
+        }
+    }
 }
 
 void font_destroy(void)
 {
-    if (ctx.face) {
-        FT_Done_Face(ctx.face);
+    for (size_t i = 0; i < ctx.num_fonts; i++) {
+        // Free glyph cache
+        for (int j = 0; j < GLYPH_CACHE_SIZE; j++) {
+            if (ctx.fonts[i].glyph_cache[j].glyph) {
+                FT_Done_Glyph(ctx.fonts[i].glyph_cache[j].glyph);
+            }
+        }
+
+        if (ctx.fonts[i].face) {
+            FT_Done_Face(ctx.fonts[i].face);
+        }
+        free(ctx.fonts[i].name);  // Frees both name and ranges (single allocation)
+        free(ctx.fonts[i].font_path);
     }
     if (ctx.lib) {
         FT_Done_FreeType(ctx.lib);
@@ -163,13 +532,7 @@ void font_destroy(void)
 
 bool font_render(const char* text, struct text_surface* surface)
 {
-    size_t space_size;
-    size_t base_offset;
-    wchar_t* wide;
-    wchar_t* it;
-    size_t x = 0;
-
-    if (!ctx.face) {
+    if (ctx.num_fonts == 0) {
         return false;
     }
     if (!text || !*text) {
@@ -178,45 +541,57 @@ bool font_render(const char* text, struct text_surface* surface)
         return true;
     }
 
-    space_size = ctx.face->size->metrics.x_ppem / SPACE_WH_REL;
+    // Ensure first font is loaded for metrics
+    if (!ensure_font_loaded(&ctx.fonts[0])) {
+        return false;
+    }
 
-    wide = str_to_wide(text, NULL);
+    FT_Face default_face = ctx.fonts[0].face;
+    size_t space_size = default_face->size->metrics.x_ppem / SPACE_WH_REL;
+    wchar_t* wide = str_to_wide(text, NULL);
+
     if (!wide) {
         return false;
     }
 
-    base_offset = allocate_surface(wide, surface);
+    size_t base_offset = allocate_surface(wide, surface);
     if (base_offset == SIZE_MAX) {
         free(wide);
         return false;
     }
 
     // draw glyphs
-    it = wide;
+    size_t x = 0;
+    wchar_t* it = wide;
     while (*it) {
         if (*it == L' ') {
             x += space_size;
-        } else if (FT_Load_Char(ctx.face, *it, FT_LOAD_RENDER) == 0) {
-            const FT_GlyphSlot glyph = ctx.face->glyph;
-            const FT_Bitmap* bmp = &glyph->bitmap;
-            const size_t off_y = base_offset - glyph->bitmap_top;
-            size_t size;
+        } else {
+            struct font_entry* entry = find_font_entry_for_char(*it);
+            if (entry) {
+                int advance;
+                FT_Glyph glyph = get_cached_glyph(entry, *it, &advance);
+                if (glyph) {
+                    // Render glyph
+                    FT_Vector origin = { (FT_Pos)(x * 64), (FT_Pos)(base_offset * 64) };
+                    FT_Glyph_To_Bitmap(&glyph, FT_RENDER_MODE_NORMAL, &origin, 1);
+                    FT_BitmapGlyph bitmap_glyph = (FT_BitmapGlyph)glyph;
 
-            // calc line width, floating point math doesn't match bmp width
-            if (x + bmp->width < surface->width) {
-                size = bmp->width;
-            } else {
-                size = surface->width - x;
+                    const FT_Bitmap* bmp = &bitmap_glyph->bitmap;
+                    const size_t off_y = base_offset - bitmap_glyph->top;
+
+                    size_t size = (x + bmp->width < surface->width) ?
+                                  bmp->width : surface->width - x;
+
+                    for (size_t y = 0; y < bmp->rows; ++y) {
+                        const size_t offset = (y + off_y) * surface->width + x;
+                        uint8_t* dst = &surface->data[offset + bitmap_glyph->left];
+                        memcpy(dst, &bmp->buffer[y * bmp->pitch], size);
+                    }
+
+                    x += advance;
+                }
             }
-
-            // put glyph's bitmap on the surface
-            for (size_t y = 0; y < bmp->rows; ++y) {
-                const size_t offset = (y + off_y) * surface->width + x;
-                uint8_t* dst = &surface->data[offset + glyph->bitmap_left];
-                memcpy(dst, &bmp->buffer[y * bmp->pitch], size);
-            }
-
-            x += glyph->advance.x / POINT_FACTOR;
         }
         ++it;
     }
